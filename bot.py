@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -20,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 DB_FILE = "scores.db"
 QUESTIONS_FILE = "questions.json"
+
+SESSION_LENGTH_DEFAULT = 5
+NEXT_QUESTION_DELAY_SECONDS = 2  # short pause before auto-sending next question
 
 # ---------- Database ----------
 
@@ -94,6 +98,14 @@ QUESTIONS = load_questions()
 # Keyed by (chat_id, message_id) -> correct_option_index
 ACTIVE_QUESTIONS = {}
 
+# Tracks an in-progress multi-question session per chat.
+# Keyed by chat_id -> {
+#   "questions": [list of question dicts for this session],
+#   "index": current question number (0-based),
+#   "correct_count": how many were answered correctly during the session,
+# }
+ACTIVE_SESSIONS = {}
+
 
 # ---------- Handlers ----------
 
@@ -101,16 +113,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "سلام! 👋 به بات کوییز خوش اومدی.\n\n"
         "دستورات:\n"
-        "/quiz - شروع یه سوال جدید\n"
-        "/score - امتیاز خودت رو ببین\n"
+        "/quiz - شروع یه دوره ۵ سوالی (سوالات خودشون پشت‌سرهم میان)\n"
+        "/quiz 10 - شروع یه دوره با تعداد دلخواه سوال\n"
+        "/score - امتیاز کلی خودت رو ببین\n"
         "/leaderboard - جدول برترین‌ها\n"
     )
 
 
-async def send_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    q = random.choice(QUESTIONS)
-
+async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE, q: dict, q_number: int, total: int):
     buttons = [
         [InlineKeyboardButton(opt, callback_data=str(i))]
         for i, opt in enumerate(q["options"])
@@ -119,11 +129,39 @@ async def send_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"❓ {q['question']}",
+        text=f"❓ سوال {q_number}/{total}\n\n{q['question']}",
         reply_markup=markup,
     )
 
     ACTIVE_QUESTIONS[(chat_id, msg.message_id)] = q["correct"]
+
+
+async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    if chat_id in ACTIVE_SESSIONS:
+        await update.message.reply_text("یه دوره کوییز همین الان در حال اجراست، اول اونو تموم کن! 🙂")
+        return
+
+    # Optional argument: /quiz 10
+    length = SESSION_LENGTH_DEFAULT
+    if context.args:
+        try:
+            length = max(1, min(int(context.args[0]), len(QUESTIONS)))
+        except ValueError:
+            pass
+
+    length = min(length, len(QUESTIONS))
+    session_questions = random.sample(QUESTIONS, length)
+
+    ACTIVE_SESSIONS[chat_id] = {
+        "questions": session_questions,
+        "index": 0,
+        "correct_count": 0,
+    }
+
+    await update.message.reply_text(f"🎯 یه دوره {length} سوالی شروع شد! آماده باش...")
+    await send_question(chat_id, context, session_questions[0], 1, length)
 
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,18 +179,44 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     username = user.username or user.first_name
 
+    session = ACTIVE_SESSIONS.get(chat_id)
+
     if chosen_index == correct_index:
         add_point(user.id, chat_id, username)
         new_score = get_score(user.id, chat_id)
         await query.answer("✅ آفرین، درست بود!")
         await query.edit_message_text(
-            f"{query.message.text}\n\n✅ {username} درست جواب داد! (امتیاز: {new_score})"
+            f"{query.message.text}\n\n✅ {username} درست جواب داد! (امتیاز کلی: {new_score})"
         )
+        if session is not None:
+            session["correct_count"] += 1
     else:
         await query.answer("❌ اشتباه بود!")
+        correct_text = query.message.reply_markup.inline_keyboard[correct_index][0].text
         await query.edit_message_text(
-            f"{query.message.text}\n\n❌ {username} اشتباه جواب داد."
+            f"{query.message.text}\n\n❌ {username} اشتباه جواب داد. (جواب درست: {correct_text})"
         )
+
+    # If this question belongs to an active session, move on automatically.
+    if session is not None:
+        session["index"] += 1
+        total = len(session["questions"])
+
+        if session["index"] < total:
+            await asyncio.sleep(NEXT_QUESTION_DELAY_SECONDS)
+            next_q = session["questions"][session["index"]]
+            await send_question(chat_id, context, next_q, session["index"] + 1, total)
+        else:
+            correct_count = session["correct_count"]
+            del ACTIVE_SESSIONS[chat_id]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🏁 دوره تموم شد!\n"
+                    f"از {total} سوال، {correct_count} تا درست جواب داده شد.\n\n"
+                    f"برای شروع دوباره: /quiz"
+                ),
+            )
 
 
 async def score(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -190,7 +254,7 @@ def main():
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("quiz", send_quiz))
+    app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("score", score))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CallbackQueryHandler(handle_answer))
