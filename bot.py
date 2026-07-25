@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -44,9 +45,10 @@ BTN_QUIZ = "🎯 شروع بازی"
 BTN_SCORE = "🏆 امتیاز من"
 BTN_LEADERBOARD = "📊 جدول برترین‌ها"
 BTN_INVITE = "🎮 دعوت دوست"
+BTN_SUGGEST = "📝 پیشنهاد سوال"
 
 MAIN_MENU = ReplyKeyboardMarkup(
-    [[BTN_QUIZ], [BTN_SCORE, BTN_LEADERBOARD], [BTN_INVITE]],
+    [[BTN_QUIZ], [BTN_SCORE, BTN_LEADERBOARD], [BTN_INVITE, BTN_SUGGEST]],
     resize_keyboard=True,
 )
 
@@ -381,6 +383,14 @@ PENDING_INVITES = {}
 # type a username as their next message.
 AWAITING_INVITE_USERNAME = set()
 
+# Step-by-step "suggest a question" flow.
+# Keyed by user_id -> {"step": int, "data": {...}}
+SUGGESTION_STATE = {}
+
+# Once all 5 fields are collected, waits for the user to tap which option is correct.
+# Keyed by user_id -> {"question":..., "option1":..., ...}
+PENDING_SUGGESTIONS = {}
+
 # Active duels. Keyed by duel_id -> {
 #   "questions": [...],
 #   "players": {user_id: {"index": 0, "correct": 0, "username": str, "chat_id": int}},
@@ -504,49 +514,129 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == BTN_INVITE:
         AWAITING_INVITE_USERNAME.add(update.effective_user.id)
         await update.message.reply_text("یوزرنیم دوستت رو بفرست (بدون @) تا دعوتش کنم به یه بازی دونفره.")
+    elif text == BTN_SUGGEST:
+        await suggest_start(update, context)
+
+
+async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback router for free-text replies that belong to a multi-step flow
+    (question suggestion or invite-friend), checked in priority order."""
+    user_id = update.effective_user.id
+
+    if user_id in SUGGESTION_STATE:
+        await handle_suggestion_step(update, context)
+        return
+
+    if user_id in AWAITING_INVITE_USERNAME:
+        AWAITING_INVITE_USERNAME.discard(user_id)
+        await process_invite(update, context, update.message.text)
+        return
 
 
 # ---------- Suggest a question ----------
 
-async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def suggest_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kicks off the step-by-step question-suggestion flow (from /suggest or the button)."""
     track_user(update.effective_user, update.effective_chat)
-    raw = update.message.text.partition(" ")[2].strip()
+    user_id = update.effective_user.id
+    SUGGESTION_STATE[user_id] = {"step": 0, "data": {}}
+    await update.message.reply_text(
+        "بریم یه سوال بسازیم! 📝 (هر وقت خواستی منصرف بشی بنویس /cancel)\n\n"
+        "اول: متن سوالت رو بنویس."
+    )
 
-    if not raw:
+
+async def cancel_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in SUGGESTION_STATE:
+        del SUGGESTION_STATE[user_id]
+        await update.message.reply_text("لغو شد.")
+
+
+OPTIONS_PROMPT = (
+    "حالا هر ۴ گزینه رو با هم، هر کدوم تو یه خط، اینجوری بفرست:\n\n"
+    "الف) گزینه اول\n"
+    "ب) گزینه دوم\n"
+    "ج) گزینه سوم\n"
+    "د) گزینه چهارم"
+)
+
+OPTION_PREFIX_RE = re.compile(r"^\s*(الف|ب|ج|د)\s*[\)\.\-:]\s*")
+
+
+def parse_option_lines(text: str):
+    """Parses 4 lines like 'الف) گزینه' into a plain list of 4 option strings, or None if invalid."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) != 4:
+        return None
+    cleaned = []
+    for line in lines:
+        match = OPTION_PREFIX_RE.match(line)
+        cleaned.append(line[match.end():].strip() if match else line)
+    if any(not c for c in cleaned):
+        return None
+    return cleaned
+
+
+async def handle_suggestion_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = SUGGESTION_STATE[user_id]
+    step = state["step"]
+    text = update.message.text.strip()
+
+    if step == 0:
+        state["data"]["question"] = text
+        state["step"] = 1
+        await update.message.reply_text(OPTIONS_PROMPT)
+        return
+
+    # step == 1: expecting all 4 options at once
+    options = parse_option_lines(text)
+    if options is None:
         await update.message.reply_text(
-            "برای پیشنهاد سوال، این فرمت رو بنویس (با | از هم جدا کن):\n\n"
-            "/suggest سوالت؟ | گزینه۱ | گزینه۲ | گزینه۳ | گزینه۴ | شماره گزینه درست (۱ تا ۴)\n\n"
-            "مثال:\n"
-            "/suggest پایتخت آلمان کجاست؟ | مونیخ | برلین | هامبورگ | کلن | 2"
+            "درست تشخیص ندادم 🙁 لطفاً دقیقاً ۴ خط بفرست، هر خط یه گزینه:\n\n" + OPTIONS_PROMPT
         )
         return
 
-    parts = [p.strip() for p in raw.split("|")]
-    if len(parts) != 6:
-        await update.message.reply_text("فرمت درست نیست. باید دقیقاً ۶ بخش با | جدا شده باشه (سوال + ۴ گزینه + شماره جواب).")
+    data = state["data"]
+    data["options"] = options
+    del SUGGESTION_STATE[user_id]
+    PENDING_SUGGESTIONS[user_id] = data
+
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"الف) {options[0]}", callback_data="suggcorrect_0")],
+        [InlineKeyboardButton(f"ب) {options[1]}", callback_data="suggcorrect_1")],
+        [InlineKeyboardButton(f"ج) {options[2]}", callback_data="suggcorrect_2")],
+        [InlineKeyboardButton(f"د) {options[3]}", callback_data="suggcorrect_3")],
+    ])
+    await update.message.reply_text("عالی! حالا بگو کدوم گزینه جواب درسته:", reply_markup=buttons)
+
+
+async def handle_suggestion_correct_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    data = PENDING_SUGGESTIONS.get(user.id)
+
+    if not data:
+        await query.answer("این پیشنهاد منقضی شده، دوباره از /suggest شروع کن.", show_alert=True)
         return
 
-    question_text, opt1, opt2, opt3, opt4, correct_raw = parts
-    try:
-        correct_num = int(correct_raw)
-        if correct_num < 1 or correct_num > 4:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("شماره گزینه درست باید عددی بین ۱ تا ۴ باشه.")
-        return
+    del PENDING_SUGGESTIONS[user.id]
+    correct_index = int(query.data.rsplit("_", 1)[1])
 
-    user = update.effective_user
     username = user.username or user.first_name
-    suggestion_id = add_suggestion(user.id, username, question_text, [opt1, opt2, opt3, opt4], correct_num - 1)
+    options = data["options"]
+    suggestion_id = add_suggestion(user.id, username, data["question"], options, correct_index)
 
-    await update.message.reply_text("ممنون! سوالت برای بررسی ادمین ارسال شد. ✅")
+    await query.answer("ثبت شد!")
+    await query.edit_message_text("ممنون! سوالت برای بررسی ادمین ارسال شد. ✅")
 
     admin_text = (
         f"📝 پیشنهاد سوال جدید (#{suggestion_id})\n"
         f"از طرف: {username}\n\n"
-        f"❓ {question_text}\n"
-        f"1) {opt1}\n2) {opt2}\n3) {opt3}\n4) {opt4}\n\n"
-        f"✅ جواب درست: گزینه {correct_num}"
+        f"❓ {data['question']}\n"
+        f"1) {options[0]}\n2) {options[1]}\n3) {options[2]}\n4) {options[3]}\n\n"
+        f"✅ جواب درست: گزینه {correct_index + 1}"
     )
     admin_buttons = InlineKeyboardMarkup([
         [
@@ -678,15 +768,6 @@ async def process_invite(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
     except Exception as e:
         logger.warning("Could not send invite: %s", e)
         await update.message.reply_text("نتونستم پیام دعوت رو بفرستم، شاید بات رو بلاک کرده.")
-
-
-async def handle_invite_username_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catches the free-text username typed after tapping the 'invite friend' button."""
-    user_id = update.effective_user.id
-    if user_id not in AWAITING_INVITE_USERNAME:
-        return
-    AWAITING_INVITE_USERNAME.discard(user_id)
-    await process_invite(update, context, update.message.text)
 
 
 async def handle_invite_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -905,6 +986,8 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_quiz_answer(update, context)
     elif data.startswith("report_"):
         await handle_report(update, context)
+    elif data.startswith("suggcorrect_"):
+        await handle_suggestion_correct_choice(update, context)
     elif data.startswith("suggapprove_") or data.startswith("suggreject_"):
         await handle_suggestion_review(update, context)
     elif data.startswith("duelans_"):
@@ -1068,15 +1151,16 @@ def main():
     app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("score", score))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
-    app.add_handler(CommandHandler("suggest", suggest_cmd))
+    app.add_handler(CommandHandler("suggest", suggest_start))
+    app.add_handler(CommandHandler("cancel", cancel_suggestion))
     app.add_handler(CommandHandler("invite", invite_cmd))
     app.add_handler(
         MessageHandler(
-            filters.Regex(f"^({BTN_QUIZ}|{BTN_SCORE}|{BTN_LEADERBOARD}|{BTN_INVITE})$"),
+            filters.Regex(f"^({BTN_QUIZ}|{BTN_SCORE}|{BTN_LEADERBOARD}|{BTN_INVITE}|{BTN_SUGGEST})$"),
             menu_button,
         )
     )
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_invite_username_input))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
     app.add_handler(CallbackQueryHandler(on_callback_query))
 
     # Admin-only commands
