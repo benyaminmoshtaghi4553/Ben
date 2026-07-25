@@ -46,9 +46,10 @@ BTN_SCORE = "🏆 امتیاز من"
 BTN_LEADERBOARD = "📊 جدول برترین‌ها"
 BTN_INVITE = "🎮 دعوت دوست"
 BTN_SUGGEST = "📝 پیشنهاد سوال"
+BTN_FIND_OPPONENT = "🔎 پیدا کردن حریف تصادفی"
 
 MAIN_MENU = ReplyKeyboardMarkup(
-    [[BTN_QUIZ], [BTN_SCORE, BTN_LEADERBOARD], [BTN_INVITE, BTN_SUGGEST]],
+    [[BTN_QUIZ], [BTN_SCORE, BTN_LEADERBOARD], [BTN_INVITE, BTN_SUGGEST], [BTN_FIND_OPPONENT]],
     resize_keyboard=True,
 )
 
@@ -62,17 +63,38 @@ def is_admin(user_id: int) -> bool:
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
+
+    # If an old per-chat scores table exists (from before the scoring format changed),
+    # migrate everyone's total into the new global-score table, then replace it.
+    cur.execute("PRAGMA table_info(scores)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    if existing_columns and "chat_id" in existing_columns:
+        cur.execute("SELECT user_id, username, SUM(score) FROM scores GROUP BY user_id")
+        migrated_rows = cur.fetchall()
+        cur.execute("ALTER TABLE scores RENAME TO scores_old_per_chat")
+        conn.commit()
+    else:
+        migrated_rows = None
+
+    # One global score per user (not per chat) — simpler mental model.
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS scores (
-            user_id INTEGER,
-            chat_id INTEGER,
+            user_id INTEGER PRIMARY KEY,
             username TEXT,
-            score INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, chat_id)
+            score INTEGER DEFAULT 0
         )
         """
     )
+
+    if migrated_rows:
+        cur.executemany(
+            "INSERT OR REPLACE INTO scores (user_id, username, score) VALUES (?, ?, ?)",
+            migrated_rows,
+        )
+        conn.commit()
+        logger.info("Migrated %d users' scores from the old per-chat schema.", len(migrated_rows))
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -98,17 +120,6 @@ def init_db():
             option4 TEXT,
             correct_index INTEGER,
             status TEXT DEFAULT 'pending',
-            created_at TEXT
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            question_text TEXT,
             created_at TEXT
         )
         """
@@ -178,41 +189,36 @@ def increment_questions_answered(user_id: int):
     conn.close()
 
 
-def add_point(user_id: int, chat_id: int, username: str, amount: int = 1):
+def add_point(user_id: int, username: str, amount: int = 1):
+    """Adds (or subtracts, with a negative amount) to a user's single global score."""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO scores (user_id, chat_id, username, score)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id, chat_id)
+        INSERT INTO scores (user_id, username, score)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id)
         DO UPDATE SET score = score + excluded.score, username = excluded.username
         """,
-        (user_id, chat_id, username, amount),
+        (user_id, username, amount),
     )
     conn.commit()
     conn.close()
 
 
-def get_score(user_id: int, chat_id: int) -> int:
+def get_score(user_id: int) -> int:
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute(
-        "SELECT score FROM scores WHERE user_id = ? AND chat_id = ?",
-        (user_id, chat_id),
-    )
+    cur.execute("SELECT score FROM scores WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else 0
 
 
-def get_leaderboard(chat_id: int, limit: int = 10):
+def get_leaderboard(limit: int = 10):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute(
-        "SELECT username, score FROM scores WHERE chat_id = ? ORDER BY score DESC LIMIT ?",
-        (chat_id, limit),
-    )
+    cur.execute("SELECT username, score FROM scores ORDER BY score DESC LIMIT ?", (limit,))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -231,15 +237,7 @@ def get_global_stats():
     cur.execute("SELECT COUNT(*) FROM users WHERE is_blocked = 1")
     total_blocked = cur.fetchone()[0]
 
-    cur.execute(
-        """
-        SELECT username, SUM(score) as total_score
-        FROM scores
-        GROUP BY user_id
-        ORDER BY total_score DESC
-        LIMIT 5
-        """
-    )
+    cur.execute("SELECT username, score FROM scores ORDER BY score DESC LIMIT 5")
     top_scorers = cur.fetchall()
 
     conn.close()
@@ -274,6 +272,33 @@ def get_user_by_username(username: str):
     return row
 
 
+def get_user_by_id(user_id: int):
+    """Returns (user_id, private_chat_id) for a given numeric Telegram ID, or None."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, private_chat_id FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_user_by_identifier(identifier: str):
+    """Accepts either a @username or a numeric Telegram ID and looks it up either way."""
+    identifier = identifier.strip().lstrip("@")
+    if identifier.isdigit():
+        return get_user_by_id(int(identifier))
+    return get_user_by_username(identifier)
+
+
+def get_username_for(user_id: int) -> str:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else str(user_id)
+
+
 def get_private_chat_id(user_id: int):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -283,7 +308,7 @@ def get_private_chat_id(user_id: int):
     return row[0] if row and row[0] else None
 
 
-# ---------- Suggestions & reports ----------
+# ---------- Suggestions ----------
 
 def add_suggestion(user_id: int, username: str, question: str, options: list, correct_index: int) -> int:
     conn = sqlite3.connect(DB_FILE)
@@ -345,17 +370,6 @@ def load_custom_questions():
     return result
 
 
-def add_report(user_id: int, username: str, question_text: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO reports (user_id, username, question_text, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, username, question_text, datetime.now(timezone.utc).isoformat()),
-    )
-    conn.commit()
-    conn.close()
-
-
 # ---------- Questions ----------
 
 def load_questions():
@@ -369,10 +383,6 @@ QUESTIONS = load_questions()
 # Keyed by (chat_id, message_id) -> correct_option_index
 ACTIVE_QUESTIONS = {}
 
-# Keeps the question text available for reporting even briefly after it's answered.
-# Keyed by (chat_id, message_id) -> question text
-QUESTION_TEXT_BY_MESSAGE = {}
-
 # Tracks an in-progress multi-question session per chat.
 ACTIVE_SESSIONS = {}
 
@@ -383,13 +393,15 @@ PENDING_INVITES = {}
 # type a username as their next message.
 AWAITING_INVITE_USERNAME = set()
 
-# Step-by-step "suggest a question" flow.
-# Keyed by user_id -> {"step": int, "data": {...}}
+# Step-by-step "suggest a question" flow. Keyed by user_id -> {"step": int, "data": {...}}
 SUGGESTION_STATE = {}
 
-# Once all 5 fields are collected, waits for the user to tap which option is correct.
-# Keyed by user_id -> {"question":..., "option1":..., ...}
+# Once all fields are collected, waits for the user to tap which option is correct.
 PENDING_SUGGESTIONS = {}
+
+# Step-by-step admin actions (add/remove score, block, unblock, broadcast).
+# Keyed by user_id -> {"action": str, "step": int, "data": {...}}
+ADMIN_STATE = {}
 
 # Active duels. Keyed by duel_id -> {
 #   "questions": [...],
@@ -397,8 +409,11 @@ PENDING_SUGGESTIONS = {}
 # }
 DUELS = {}
 
+# Random-opponent matchmaking queue. List of (user_id, private_chat_id, username).
+MATCHMAKING_QUEUE = []
 
-# ---------- Handlers ----------
+
+# ---------- Basic handlers ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user, update.effective_chat)
@@ -410,7 +425,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/score - امتیاز کلی خودت\n"
         "/leaderboard - جدول برترین‌ها\n"
         "/suggest - پیشنهاد یه سوال جدید\n"
-        "/invite <یوزرنیم> - دعوت یه دوست به بازی دونفره\n",
+        "/invite <یوزرنیم> - دعوت یه دوست به بازی دونفره\n"
+        "/findopponent - جستجوی حریف تصادفی\n",
         reply_markup=MAIN_MENU,
     )
 
@@ -428,20 +444,6 @@ async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE, q: dic
     )
 
     ACTIVE_QUESTIONS[(chat_id, msg.message_id)] = q["correct"]
-    QUESTION_TEXT_BY_MESSAGE[(chat_id, msg.message_id)] = q["question"]
-
-    # Add the report button as a second step so we can reference the message_id.
-    buttons_with_report = buttons + [
-        [InlineKeyboardButton("🚩 گزارش این سوال", callback_data=f"report_{chat_id}_{msg.message_id}")]
-    ]
-    try:
-        await context.bot.edit_message_reply_markup(
-            chat_id=chat_id,
-            message_id=msg.message_id,
-            reply_markup=InlineKeyboardMarkup(buttons_with_report),
-        )
-    except Exception as e:
-        logger.warning("Could not attach report button: %s", e)
 
 
 async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -466,35 +468,39 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     length = min(length, len(QUESTIONS))
     session_questions = random.sample(QUESTIONS, length)
+    is_group = update.effective_chat.type != "private"
 
     ACTIVE_SESSIONS[chat_id] = {
         "questions": session_questions,
         "index": 0,
         "correct_count": 0,
         "participants": set(),
+        "participant_scores": {},  # user_id -> {"username": str, "correct": int}
     }
 
-    await update.message.reply_text(f"🎯 یه دوره {length} سوالی شروع شد! آماده باش...")
+    if is_group:
+        await update.message.reply_text(
+            f"🎯 یه دوره {length} سوالی برای کل گروه شروع شد! هرکی زودتر و درست‌تر جواب بده، امتیاز می‌گیره. آماده باشید..."
+        )
+    else:
+        await update.message.reply_text(f"🎯 یه دوره {length} سوالی شروع شد! آماده باش...")
     await send_question(chat_id, context, session_questions[0], 1, length)
 
 
 async def score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user, update.effective_chat)
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    s = get_score(user.id, chat_id)
-    await update.message.reply_text(f"امتیاز تو: {s} 🏆")
+    s = get_score(update.effective_user.id)
+    await update.message.reply_text(f"امتیاز کلی تو: {s} 🏆")
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user, update.effective_chat)
-    chat_id = update.effective_chat.id
-    rows = get_leaderboard(chat_id)
+    rows = get_leaderboard()
     if not rows:
         await update.message.reply_text("هنوز کسی امتیازی نگرفته! با /quiz شروع کن.")
         return
 
-    text = "🏆 جدول برترین‌ها:\n\n"
+    text = "🏆 جدول برترین‌ها (کل بات):\n\n"
     medals = ["🥇", "🥈", "🥉"]
     for i, (username, s) in enumerate(rows):
         prefix = medals[i] if i < 3 else f"{i + 1}."
@@ -516,12 +522,17 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("یوزرنیم دوستت رو بفرست (بدون @) تا دعوتش کنم به یه بازی دونفره.")
     elif text == BTN_SUGGEST:
         await suggest_start(update, context)
+    elif text == BTN_FIND_OPPONENT:
+        await find_opponent_cmd(update, context)
 
 
 async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fallback router for free-text replies that belong to a multi-step flow
-    (question suggestion or invite-friend), checked in priority order."""
+    """Fallback router for free-text replies belonging to a multi-step flow, in priority order."""
     user_id = update.effective_user.id
+
+    if user_id in ADMIN_STATE:
+        await handle_admin_text_step(update, context)
+        return
 
     if user_id in SUGGESTION_STATE:
         await handle_suggestion_step(update, context)
@@ -533,10 +544,9 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# ---------- Suggest a question ----------
+# ---------- Suggest a question (step-by-step, no special format needed) ----------
 
 async def suggest_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kicks off the step-by-step question-suggestion flow (from /suggest or the button)."""
     track_user(update.effective_user, update.effective_chat)
     user_id = update.effective_user.id
     SUGGESTION_STATE[user_id] = {"step": 0, "data": {}}
@@ -548,9 +558,17 @@ async def suggest_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    cancelled = False
     if user_id in SUGGESTION_STATE:
         del SUGGESTION_STATE[user_id]
-        await update.message.reply_text("لغو شد.")
+        cancelled = True
+    if user_id in ADMIN_STATE:
+        del ADMIN_STATE[user_id]
+        cancelled = True
+    if user_id in AWAITING_INVITE_USERNAME:
+        AWAITING_INVITE_USERNAME.discard(user_id)
+        cancelled = True
+    await update.message.reply_text("لغو شد." if cancelled else "چیزی برای لغو کردن نبود.")
 
 
 OPTIONS_PROMPT = (
@@ -565,7 +583,6 @@ OPTION_PREFIX_RE = re.compile(r"^\s*(الف|ب|ج|د)\s*[\)\.\-:]\s*")
 
 
 def parse_option_lines(text: str):
-    """Parses 4 lines like 'الف) گزینه' into a plain list of 4 option strings, or None if invalid."""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if len(lines) != 4:
         return None
@@ -590,7 +607,6 @@ async def handle_suggestion_step(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(OPTIONS_PROMPT)
         return
 
-    # step == 1: expecting all 4 options at once
     options = parse_option_lines(text)
     if options is None:
         await update.message.reply_text(
@@ -694,49 +710,28 @@ async def handle_suggestion_review(update: Update, context: ContextTypes.DEFAULT
             logger.warning("Could not notify suggester %s: %s", s_user_id, e)
 
 
-# ---------- Report a question ----------
-
-async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    _, chat_id_str, message_id_str = query.data.split("_")
-    chat_id, message_id = int(chat_id_str), int(message_id_str)
-
-    question_text = QUESTION_TEXT_BY_MESSAGE.get((chat_id, message_id), "متن سوال پیدا نشد")
-    user = query.from_user
-    username = user.username or user.first_name
-    add_report(user.id, username, question_text)
-
-    await query.answer("گزارش شما برای ادمین ارسال شد. ممنون! 🙏", show_alert=True)
-
-    report_text = f"🚩 گزارش سوال\nاز طرف: {username}\n\n❓ {question_text}"
-    for admin_id in ADMIN_IDS:
-        admin_chat_id = get_private_chat_id(admin_id)
-        if admin_chat_id:
-            try:
-                await context.bot.send_message(chat_id=admin_chat_id, text=report_text)
-            except Exception as e:
-                logger.warning("Could not notify admin %s about report: %s", admin_id, e)
-
-
 # ---------- Direct game invite (1v1 duel) ----------
 
 async def invite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user, update.effective_chat)
 
     if not context.args:
-        await update.message.reply_text("فرمت درست: /invite یوزرنیم_دوستت  (مثلاً /invite ali_123)")
+        await update.message.reply_text(
+            "فرمت درست: /invite یوزرنیم_دوستت  (یا آیدی عددیش)\nمثال: /invite ali_123"
+        )
         return
 
     await process_invite(update, context, context.args[0])
 
 
-async def process_invite(update: Update, context: ContextTypes.DEFAULT_TYPE, target_username: str):
+async def process_invite(update: Update, context: ContextTypes.DEFAULT_TYPE, target_identifier: str):
     inviter = update.effective_user
-    target_username = target_username.strip()
-    target = get_user_by_username(target_username)
+    target = get_user_by_identifier(target_identifier)
 
     if not target:
-        await update.message.reply_text("این کاربر هنوز با بات آشنا نشده (باید حداقل یه بار /start بزنه).")
+        await update.message.reply_text(
+            "همچین کاربری پیدا نشد. مطمئن شو یوزرنیم یا آیدی رو درست فرستادی و اون شخص حداقل یه بار با بات صحبت کرده."
+        )
         return
 
     target_id, target_chat_id = target
@@ -746,7 +741,10 @@ async def process_invite(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         return
 
     if not target_chat_id:
-        await update.message.reply_text("این کاربر باید اول توی چت خصوصی با بات /start بزنه تا بتونی دعوتش کنی.")
+        await update.message.reply_text(
+            "این کاربر رو پیدا کردم، ولی چون قبلاً فقط توی یه گروه با بات تعامل داشته (نه توی چت خصوصی)، "
+            "نمی‌تونم براش پیام خصوصی بفرستم. ازش بخواه یه بار توی چت خصوصی بات /start بزنه."
+        )
         return
 
     PENDING_INVITES[target_id] = inviter.id
@@ -802,31 +800,33 @@ async def handle_invite_response(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     target_username = target_user.username or target_user.first_name
-    inviter_username = None  # filled in below once we track_user for them via DB lookup fallback
+    inviter_username = get_username_for(inviter_id)
 
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT username FROM users WHERE user_id = ?", (inviter_id,))
-    row = cur.fetchone()
-    conn.close()
-    inviter_username = row[0] if row else str(inviter_id)
+    await start_duel(
+        inviter_id, inviter_chat_id, inviter_username,
+        target_user.id, query.message.chat_id, target_username,
+        context,
+    )
 
+
+async def start_duel(id_a: int, chat_a: int, username_a: str, id_b: int, chat_b: int, username_b: str, context: ContextTypes.DEFAULT_TYPE):
+    """Creates a fresh duel between two players and sends each their first question."""
     duel_id = uuid.uuid4().hex[:8]
     duel_questions = random.sample(QUESTIONS, min(DUEL_LENGTH, len(QUESTIONS)))
 
     DUELS[duel_id] = {
         "questions": duel_questions,
         "players": {
-            inviter_id: {"index": 0, "correct": 0, "username": inviter_username, "chat_id": inviter_chat_id},
-            target_user.id: {"index": 0, "correct": 0, "username": target_username, "chat_id": query.message.chat_id},
+            id_a: {"index": 0, "correct": 0, "username": username_a, "chat_id": chat_a},
+            id_b: {"index": 0, "correct": 0, "username": username_b, "chat_id": chat_b},
         },
     }
 
-    await context.bot.send_message(chat_id=inviter_chat_id, text=f"🎮 بازی با {target_username} شروع شد! سوال اول:")
-    await context.bot.send_message(chat_id=query.message.chat_id, text=f"🎮 بازی با {inviter_username} شروع شد! سوال اول:")
+    await context.bot.send_message(chat_id=chat_a, text=f"🎮 بازی با {username_b} شروع شد! سوال اول:")
+    await context.bot.send_message(chat_id=chat_b, text=f"🎮 بازی با {username_a} شروع شد! سوال اول:")
 
-    await send_duel_question(duel_id, inviter_id, context)
-    await send_duel_question(duel_id, target_user.id, context)
+    await send_duel_question(duel_id, id_a, context)
+    await send_duel_question(duel_id, id_b, context)
 
 
 async def send_duel_question(duel_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -878,7 +878,7 @@ async def handle_duel_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if chosen_index == correct_index:
         player["correct"] += 1
-        add_point(user.id, player["chat_id"], player["username"])
+        add_point(user.id, player["username"])
         await query.answer("✅ درست بود!")
     else:
         await query.answer("❌ اشتباه بود!")
@@ -896,7 +896,6 @@ async def handle_duel_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await context.bot.send_message(chat_id=player["chat_id"], text="منتظر بمون تا حریفت هم تموم کنه... ⏳")
 
-    # If both players finished, announce the result.
     if all(p["index"] >= len(duel["questions"]) for p in duel["players"].values()):
         players = list(duel["players"].items())
         (id_a, p_a), (id_b, p_b) = players[0], players[1]
@@ -915,6 +914,43 @@ async def handle_duel_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.send_message(chat_id=p_b["chat_id"], text=f"🏁 نتیجه بازی با {p_a['username']}:\n{result_b}")
 
         del DUELS[duel_id]
+
+
+# ---------- Random-opponent matchmaking ----------
+
+async def find_opponent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user(update.effective_user, update.effective_chat)
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if chat.type != "private":
+        await update.message.reply_text("این قابلیت فقط توی چت خصوصی با بات کار می‌کنه، نه توی گروه.")
+        return
+
+    if any(u[0] == user.id for u in MATCHMAKING_QUEUE):
+        await update.message.reply_text("قبلاً تو صف جستجو هستی! صبر کن حریف پیدا بشه، یا برای لغو بنویس /cancelsearch")
+        return
+
+    username = user.username or user.first_name
+
+    if MATCHMAKING_QUEUE:
+        opponent_id, opponent_chat_id, opponent_username = MATCHMAKING_QUEUE.pop(0)
+        await start_duel(opponent_id, opponent_chat_id, opponent_username, user.id, chat.id, username, context)
+    else:
+        MATCHMAKING_QUEUE.append((user.id, chat.id, username))
+        await update.message.reply_text(
+            "🔎 دنبال حریف می‌گردم... به محض پیدا شدن یه نفر خبرت می‌کنم.\nبرای لغو جستجو: /cancelsearch"
+        )
+
+
+async def cancel_search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    before = len(MATCHMAKING_QUEUE)
+    MATCHMAKING_QUEUE[:] = [u for u in MATCHMAKING_QUEUE if u[0] != user_id]
+    if len(MATCHMAKING_QUEUE) < before:
+        await update.message.reply_text("جستجو لغو شد.")
+    else:
+        await update.message.reply_text("تو صف جستجو نبودی.")
 
 
 # ---------- Normal quiz-session answer ----------
@@ -944,12 +980,17 @@ async def handle_quiz_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     increment_questions_answered(user.id)
 
     if chosen_index == correct_index:
-        add_point(user.id, chat_id, username)
+        add_point(user.id, username)
         await query.answer("✅ درست بود!")
         if session is not None:
             session["correct_count"] += 1
+            p_score = session["participant_scores"].setdefault(user.id, {"username": username, "correct": 0})
+            p_score["correct"] += 1
+            p_score["username"] = username
     else:
         await query.answer("❌ اشتباه بود!")
+        if session is not None:
+            session["participant_scores"].setdefault(user.id, {"username": username, "correct": 0})
 
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -967,15 +1008,21 @@ async def handle_quiz_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await send_question(chat_id, context, next_q, session["index"] + 1, total)
         else:
             correct_count = session["correct_count"]
+            participant_scores = session["participant_scores"]
             del ACTIVE_SESSIONS[chat_id]
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"🏁 دوره تموم شد!\n"
-                    f"از {total} سوال، {correct_count} تا درست جواب داده شد.\n\n"
-                    f"برای شروع دوباره: /quiz"
-                ),
-            )
+
+            text = f"🏁 دوره تموم شد!\nاز {total} سوال، {correct_count} تا درست جواب داده شد.\n"
+
+            if len(participant_scores) > 1:
+                text += "\n📊 نتیجه هر نفر:\n"
+                ranked = sorted(participant_scores.values(), key=lambda p: p["correct"], reverse=True)
+                medals = ["🥇", "🥈", "🥉"]
+                for i, p in enumerate(ranked):
+                    prefix = medals[i] if i < 3 else f"{i + 1}."
+                    text += f"{prefix} {p['username']} — {p['correct']} درست\n"
+
+            text += "\nبرای شروع دوباره: /quiz"
+            await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 # ---------- Callback dispatcher ----------
@@ -984,8 +1031,6 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data
     if data.startswith("ans_"):
         await handle_quiz_answer(update, context)
-    elif data.startswith("report_"):
-        await handle_report(update, context)
     elif data.startswith("suggcorrect_"):
         await handle_suggestion_correct_choice(update, context)
     elif data.startswith("suggapprove_") or data.startswith("suggreject_"):
@@ -994,37 +1039,51 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_duel_answer(update, context)
     elif data.startswith("inviteacc_") or data.startswith("invitedec_"):
         await handle_invite_response(update, context)
+    elif data.startswith("adm_"):
+        await handle_admin_button(update, context)
 
 
-# ---------- Admin commands ----------
+# ---------- Admin panel ----------
+
+ADM_STATS = "adm_stats"
+ADM_PLAYING = "adm_playing"
+ADM_ADDSCORE = "adm_addscore"
+ADM_REMOVESCORE = "adm_removescore"
+ADM_BLOCK = "adm_block"
+ADM_UNBLOCK = "adm_unblock"
+ADM_BROADCAST = "adm_broadcast"
+
+
+def admin_menu_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 آمار کلی", callback_data=ADM_STATS)],
+        [InlineKeyboardButton("🎮 بازی‌های فعال الان", callback_data=ADM_PLAYING)],
+        [
+            InlineKeyboardButton("➕ افزودن امتیاز", callback_data=ADM_ADDSCORE),
+            InlineKeyboardButton("➖ کم کردن امتیاز", callback_data=ADM_REMOVESCORE),
+        ],
+        [
+            InlineKeyboardButton("🚫 مسدود کردن", callback_data=ADM_BLOCK),
+            InlineKeyboardButton("✅ رفع مسدودی", callback_data=ADM_UNBLOCK),
+        ],
+        [InlineKeyboardButton("📢 پیام همگانی", callback_data=ADM_BROADCAST)],
+    ])
+
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-
-    await update.message.reply_text(
-        "🔧 پنل ادمین\n\n"
-        "/stats - آمار کلی بات\n"
-        "/playing - کاربرانی که الان وسط بازی‌ان\n"
-        "/addscore <user_id> <amount> - افزودن امتیاز (توی همین چت)\n"
-        "/removescore <user_id> <amount> - کم کردن امتیاز (توی همین چت)\n"
-        "/block <user_id> - مسدود کردن کاربر\n"
-        "/unblock <user_id> - رفع مسدودی کاربر\n"
-        "/broadcast <متن پیام> - ارسال پیام همگانی به همه کاربرا\n"
-    )
+    await update.message.reply_text("🔧 پنل ادمین — یکی رو انتخاب کن:", reply_markup=admin_menu_markup())
 
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-
+def format_stats_text() -> str:
     s = get_global_stats()
     text = (
         "📊 آمار کلی بات\n\n"
         f"👥 تعداد کل کاربران: {s['total_users']}\n"
         f"❓ کل سوالات جواب‌داده‌شده: {s['total_answered']}\n"
         f"🚫 کاربران مسدود: {s['total_blocked']}\n\n"
-        "🏆 پرامتیازترین‌ها (کل بات):\n"
+        "🏆 پرامتیازترین‌ها:\n"
     )
     if s["top_scorers"]:
         medals = ["🥇", "🥈", "🥉"]
@@ -1033,17 +1092,12 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"{prefix} {username} — {total_score}\n"
     else:
         text += "هنوز کسی امتیازی نگرفته.\n"
+    return text
 
-    await update.message.reply_text(text)
 
-
-async def playing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-
+def format_playing_text() -> str:
     if not ACTIVE_SESSIONS and not DUELS:
-        await update.message.reply_text("الان هیچ‌کس وسط بازی نیست.")
-        return
+        return "الان هیچ‌کس وسط بازی نیست."
 
     text = ""
     if ACTIVE_SESSIONS:
@@ -1055,62 +1109,181 @@ async def playing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     if DUELS:
         text += "\n⚔️ بازی‌های دونفره فعال:\n\n"
-        for duel_id, duel in DUELS.items():
+        for duel in DUELS.values():
             names = " و ".join(p["username"] for p in duel["players"].values())
             text += f"{names}\n"
+    return text
 
-    await update.message.reply_text(text)
+
+async def handle_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("این پنل فقط برای ادمینه.", show_alert=True)
+        return
+
+    data = query.data
+    user_id = query.from_user.id
+
+    if data == ADM_STATS:
+        await query.answer()
+        await context.bot.send_message(chat_id=query.message.chat_id, text=format_stats_text())
+    elif data == ADM_PLAYING:
+        await query.answer()
+        await context.bot.send_message(chat_id=query.message.chat_id, text=format_playing_text())
+    elif data == ADM_ADDSCORE:
+        await query.answer()
+        ADMIN_STATE[user_id] = {"action": "addscore", "step": 0, "data": {}}
+        await context.bot.send_message(chat_id=query.message.chat_id, text="آیدی عددی یا یوزرنیم کاربر رو بفرست: (برای انصراف /cancel)")
+    elif data == ADM_REMOVESCORE:
+        await query.answer()
+        ADMIN_STATE[user_id] = {"action": "removescore", "step": 0, "data": {}}
+        await context.bot.send_message(chat_id=query.message.chat_id, text="آیدی عددی یا یوزرنیم کاربر رو بفرست: (برای انصراف /cancel)")
+    elif data == ADM_BLOCK:
+        await query.answer()
+        ADMIN_STATE[user_id] = {"action": "block", "step": 0, "data": {}}
+        await context.bot.send_message(chat_id=query.message.chat_id, text="آیدی عددی یا یوزرنیم کاربری که می‌خوای مسدود کنی رو بفرست: (برای انصراف /cancel)")
+    elif data == ADM_UNBLOCK:
+        await query.answer()
+        ADMIN_STATE[user_id] = {"action": "unblock", "step": 0, "data": {}}
+        await context.bot.send_message(chat_id=query.message.chat_id, text="آیدی عددی یا یوزرنیم کاربری که می‌خوای آزاد کنی رو بفرست: (برای انصراف /cancel)")
+    elif data == ADM_BROADCAST:
+        await query.answer()
+        ADMIN_STATE[user_id] = {"action": "broadcast", "step": 0, "data": {}}
+        await context.bot.send_message(chat_id=query.message.chat_id, text="متن پیام همگانی رو بفرست: (برای انصراف /cancel)")
+
+
+async def handle_admin_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = ADMIN_STATE[user_id]
+    action = state["action"]
+    text = update.message.text.strip()
+
+    if action in ("addscore", "removescore"):
+        if state["step"] == 0:
+            target = get_user_by_identifier(text)
+            if not target:
+                await update.message.reply_text("همچین کاربری پیدا نشد. دوباره امتحان کن یا /cancel بزن.")
+                return
+            state["data"]["target_id"] = target[0]
+            state["step"] = 1
+            await update.message.reply_text("چقدر امتیاز؟ (فقط عدد)")
+            return
+        else:
+            try:
+                amount = int(text)
+            except ValueError:
+                await update.message.reply_text("باید یه عدد بفرستی.")
+                return
+            target_id = state["data"]["target_id"]
+            username = get_username_for(target_id)
+            signed = amount if action == "addscore" else -amount
+            add_point(target_id, username, signed)
+            new_score = get_score(target_id)
+            del ADMIN_STATE[user_id]
+            verb = "اضافه" if action == "addscore" else "کم"
+            await update.message.reply_text(f"انجام شد ✅ {amount} امتیاز {verb} شد. امتیاز جدید {username}: {new_score}")
+            return
+
+    if action in ("block", "unblock"):
+        target = get_user_by_identifier(text)
+        if not target:
+            await update.message.reply_text("همچین کاربری پیدا نشد. دوباره امتحان کن یا /cancel بزن.")
+            return
+        target_id = target[0]
+        set_blocked(target_id, action == "block")
+        del ADMIN_STATE[user_id]
+        verb = "مسدود شد 🚫" if action == "block" else "آزاد شد ✅"
+        await update.message.reply_text(f"کاربر {get_username_for(target_id)} {verb}")
+        return
+
+    if action == "broadcast":
+        del ADMIN_STATE[user_id]
+        chat_ids = get_all_private_chat_ids()
+        sent, failed = 0, 0
+        for cid in chat_ids:
+            try:
+                await context.bot.send_message(chat_id=cid, text=f"📢 {text}")
+                sent += 1
+            except Exception as e:
+                logger.warning("Broadcast failed for %s: %s", cid, e)
+                failed += 1
+        await update.message.reply_text(f"پیام همگانی ارسال شد. موفق: {sent} — ناموفق: {failed}")
+        return
+
+
+# Legacy direct text-commands — still handy for admins who prefer typing.
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text(format_stats_text())
+
+
+async def playing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text(format_playing_text())
 
 
 async def addscore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await _adjust_score(update, context, sign=1)
+    await _adjust_score_cmd(update, context, sign=1)
 
 
 async def removescore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await _adjust_score(update, context, sign=-1)
+    await _adjust_score_cmd(update, context, sign=-1)
 
 
-async def _adjust_score(update: Update, context: ContextTypes.DEFAULT_TYPE, sign: int):
+async def _adjust_score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, sign: int):
     if len(context.args) < 2:
-        await update.message.reply_text("فرمت درست: /addscore <user_id> <amount>")
+        await update.message.reply_text("فرمت درست: /addscore <آیدی_یا_یوزرنیم> <مقدار>")
+        return
+    target = get_user_by_identifier(context.args[0])
+    if not target:
+        await update.message.reply_text("همچین کاربری پیدا نشد.")
         return
     try:
-        target_id = int(context.args[0])
         amount = int(context.args[1]) * sign
     except ValueError:
-        await update.message.reply_text("آیدی و مقدار باید عدد باشن.")
+        await update.message.reply_text("مقدار باید عدد باشه.")
         return
 
-    chat_id = update.effective_chat.id
-    add_point(target_id, chat_id, username=str(target_id), amount=amount)
-    new_score = get_score(target_id, chat_id)
-    await update.message.reply_text(f"انجام شد. امتیاز جدید کاربر {target_id} توی این چت: {new_score}")
+    target_id = target[0]
+    username = get_username_for(target_id)
+    add_point(target_id, username, amount)
+    new_score = get_score(target_id)
+    await update.message.reply_text(f"انجام شد. امتیاز جدید {username}: {new_score}")
 
 
 async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        await update.message.reply_text("فرمت درست: /block <user_id>")
+        await update.message.reply_text("فرمت درست: /block <آیدی_یا_یوزرنیم>")
         return
-    target_id = int(context.args[0])
-    set_blocked(target_id, True)
-    await update.message.reply_text(f"کاربر {target_id} مسدود شد.")
+    target = get_user_by_identifier(context.args[0])
+    if not target:
+        await update.message.reply_text("همچین کاربری پیدا نشد.")
+        return
+    set_blocked(target[0], True)
+    await update.message.reply_text(f"کاربر {get_username_for(target[0])} مسدود شد.")
 
 
 async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        await update.message.reply_text("فرمت درست: /unblock <user_id>")
+        await update.message.reply_text("فرمت درست: /unblock <آیدی_یا_یوزرنیم>")
         return
-    target_id = int(context.args[0])
-    set_blocked(target_id, False)
-    await update.message.reply_text(f"کاربر {target_id} آزاد شد.")
+    target = get_user_by_identifier(context.args[0])
+    if not target:
+        await update.message.reply_text("همچین کاربری پیدا نشد.")
+        return
+    set_blocked(target[0], False)
+    await update.message.reply_text(f"کاربر {get_username_for(target[0])} آزاد شد.")
 
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1154,16 +1327,18 @@ def main():
     app.add_handler(CommandHandler("suggest", suggest_start))
     app.add_handler(CommandHandler("cancel", cancel_suggestion))
     app.add_handler(CommandHandler("invite", invite_cmd))
+    app.add_handler(CommandHandler("findopponent", find_opponent_cmd))
+    app.add_handler(CommandHandler("cancelsearch", cancel_search_cmd))
     app.add_handler(
         MessageHandler(
-            filters.Regex(f"^({BTN_QUIZ}|{BTN_SCORE}|{BTN_LEADERBOARD}|{BTN_INVITE}|{BTN_SUGGEST})$"),
+            filters.Regex(f"^({BTN_QUIZ}|{BTN_SCORE}|{BTN_LEADERBOARD}|{BTN_INVITE}|{BTN_SUGGEST}|{BTN_FIND_OPPONENT})$"),
             menu_button,
         )
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
     app.add_handler(CallbackQueryHandler(on_callback_query))
 
-    # Admin-only commands
+    # Admin
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("playing", playing_cmd))
