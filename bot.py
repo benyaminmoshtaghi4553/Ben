@@ -329,19 +329,15 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chosen_index == correct_index:
         add_point(user.id, chat_id, username)
-        new_score = get_score(user.id, chat_id)
-        await query.answer("✅ آفرین، درست بود!")
-        await query.edit_message_text(
-            f"{query.message.text}\n\n✅ {username} درست جواب داد! (امتیاز کلی: {new_score})"
-        )
+        await query.answer("✅ درست بود!")
         if session is not None:
             session["correct_count"] += 1
     else:
         await query.answer("❌ اشتباه بود!")
-        correct_text = query.message.reply_markup.inline_keyboard[correct_index][0].text
-        await query.edit_message_text(
-            f"{query.message.text}\n\n❌ {username} اشتباه جواب داد. (جواب درست: {correct_text})"
-        )
+
+    # Remove the buttons so the question can't be answered again, without
+    # cluttering the chat with a separate correct/incorrect message.
+    await query.edit_message_reply_markup(reply_markup=None)
 
     # If this question belongs to an active session, move on automatically.
     if session is not None:
